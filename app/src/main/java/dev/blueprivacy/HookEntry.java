@@ -1,6 +1,8 @@
 package dev.blueprivacy;
 
 import android.bluetooth.BluetoothAdapter;
+import android.content.Context;
+
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -9,180 +11,277 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
- * LSPosed bridge for the native Bluetooth rename flow.
+ * BluePrivacy 1.4 - local-only LSPosed/Xposed hooks.
  *
- * Settings package: intercepts the AOSP local-device-name save method and
- * performs the same official BluetoothAdapter.setName() operation directly.
- * Bluetooth package: records whether the stack's native-name setter accepted it.
- *
- * Only the local friendly name is handled. No address or device identifiers
- * are read or changed.
+ * The module does not access network APIs, does not fake connectivity, and
+ * does not send any data to a remote endpoint. All name writes stay inside
+ * Android's local Bluetooth service/native stack. Bluetooth names are never
+ * included in logs.
  */
 public final class HookEntry implements IXposedHookLoadPackage {
-    private static final String SETTINGS = "com.android.settings";
-    private static final String BLUETOOTH = "com.android.bluetooth";
+    private static final String TAG = "BluePrivacy";
     private static final int MAX_NAME_BYTES = 248;
+
+    private static final Set<String> SETTINGS_PACKAGES = new HashSet<>(Arrays.asList(
+        "com.android.settings",
+        "com.oplus.settings",
+        "com.oneplus.settings",
+        "com.coloros.settings"
+    ));
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        if (SETTINGS.equals(lpparam.packageName)) {
+        if (SETTINGS_PACKAGES.contains(lpparam.packageName)) {
             hookSettingsRenameFlow(lpparam.classLoader);
-        } else if (BLUETOOTH.equals(lpparam.packageName)) {
+        } else if ("com.android.bluetooth".equals(lpparam.packageName)) {
             hookBluetoothStack(lpparam.classLoader);
         }
     }
 
-    private void hookSettingsRenameFlow(ClassLoader classLoader) {
-        // Observe the framework API regardless of which Settings implementation calls it.
+    private static void hookSettingsRenameFlow(ClassLoader classLoader) {
+        // Observe the public API used by Android Settings. Never log the name value.
         try {
             Class<?> adapterClass = XposedHelpers.findClass(
-                    "android.bluetooth.BluetoothAdapter", null);
-            XposedHelpers.findAndHookMethod(adapterClass, "setName", String.class,
-                    new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam param) {
-                            Object value = param.args[0];
-                            XposedBridge.log("BluePrivacy: Settings BluetoothAdapter.setName("
-                                    + safeName(value) + ")");
+                "android.bluetooth.BluetoothAdapter", null);
+            XposedHelpers.findAndHookMethod(
+                adapterClass,
+                "setName",
+                String.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        try {
+                            Object requested = param.args[0];
+                            int bytes = requested instanceof String
+                                ? ((String) requested).getBytes(StandardCharsets.UTF_8).length : -1;
+                            int state = ((Number) XposedHelpers.callMethod(
+                                param.thisObject, "getState")).intValue();
+                            boolean ok = Boolean.TRUE.equals(param.getResult());
+                            boolean readbackMatch = false;
+                            if (ok && requested instanceof String) {
+                                Object actual = XposedHelpers.callMethod(param.thisObject, "getName");
+                                readbackMatch = requested.equals(actual);
+                            }
+                            XposedBridge.log(TAG + ": Settings setName"
+                                + " state=" + state
+                                + " result=" + ok
+                                + " utf8Bytes=" + bytes
+                                + " readbackMatch=" + readbackMatch);
+                        } catch (Throwable ignored) {
+                            XposedBridge.log(TAG + ": Settings API observer failed safely.");
                         }
-
-                        @Override protected void afterHookedMethod(MethodHookParam param) {
-                            Object adapter = param.thisObject;
-                            Object state = callQuietly(adapter, "getState");
-                            Object actual = callQuietly(adapter, "getName");
-                            XposedBridge.log("BluePrivacy: setName result=" + param.getResult()
-                                    + ", state=" + state + ", readback=" + safeName(actual));
-                        }
-                    });
+                    }
+                }
+            );
         } catch (Throwable t) {
-            XposedBridge.log("BluePrivacy: cannot hook BluetoothAdapter in Settings: " + t);
+            XposedBridge.log(TAG + ": BluetoothAdapter hook unavailable in Settings: "
+                + t.getClass().getSimpleName());
         }
 
-        // AOSP's native Bluetooth rename dialog calls this method on Save.
-        // Intercept only when the normal public API succeeds and confirms the
-        // value; otherwise allow the ROM's original implementation to continue.
+        // AOSP's built-in Bluetooth rename dialog calls this method on Save.
+        // It performs the same local Android Bluetooth API call. The original
+        // OEM wrapper is suppressed only after the OS confirms the new value.
         try {
             XposedHelpers.findAndHookMethod(
-                    "com.android.settings.bluetooth.LocalDeviceNameDialogFragment",
-                    classLoader,
-                    "setDeviceName",
-                    String.class,
-                    new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam param) {
-                            Object arg = param.args[0];
-                            if (!(arg instanceof String)) return;
-                            String name = ((String) arg).trim();
-                            if (!isValidName(name)) {
-                                XposedBridge.log("BluePrivacy: rejected invalid Bluetooth name");
+                "com.android.settings.bluetooth.LocalDeviceNameDialogFragment",
+                classLoader,
+                "setDeviceName",
+                String.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        Object arg = param.args[0];
+                        if (!(arg instanceof String)) return;
+
+                        String name = ((String) arg).trim();
+                        if (!isValidName(name)) {
+                            XposedBridge.log(TAG + ": invalid local Bluetooth name rejected");
+                            return;
+                        }
+
+                        try {
+                            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+                            if (adapter == null || adapter.getState() != BluetoothAdapter.STATE_ON) {
+                                XposedBridge.log(TAG + ": rename path left untouched; adapter is not STATE_ON");
                                 return;
                             }
 
-                            try {
-                                BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
-                                if (adapter == null || adapter.getState() != BluetoothAdapter.STATE_ON) {
-                                    XposedBridge.log("BluePrivacy: native rename bypass not used; "
-                                            + "Bluetooth adapter is not STATE_ON");
-                                    return;
-                                }
+                            boolean accepted = adapter.setName(name);
+                            String actual = adapter.getName();
+                            boolean confirmed = accepted && name.equals(actual);
+                            XposedBridge.log(TAG + ": native dialog save"
+                                + " accepted=" + accepted + " readbackConfirmed=" + confirmed
+                                + " utf8Bytes=" + name.getBytes(StandardCharsets.UTF_8).length);
 
-                                boolean accepted = adapter.setName(name);
-                                String actual = adapter.getName();
-                                XposedBridge.log("BluePrivacy: native Settings save intercepted; "
-                                        + "setName=" + accepted + ", readback=" + safeName(actual));
-
-                                // Suppress only a duplicate/vendor wrapper call after a
-                                // confirmed success. If it failed, let ColorOS original code run.
-                                if (accepted && name.equals(actual)) {
-                                    param.setResult(null);
-                                }
-                            } catch (Throwable t) {
-                                XposedBridge.log("BluePrivacy: native rename interception failed: " + t);
-                            }
+                            // Return normally only after the native Bluetooth service confirms
+                            // the name; on any failure let the ColorOS/AOSP implementation run.
+                            if (confirmed) param.setResult(null);
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": native dialog fallback failed: "
+                                + t.getClass().getSimpleName());
                         }
-                    });
-            XposedBridge.log("BluePrivacy: hooked AOSP LocalDeviceNameDialogFragment");
+                    }
+                }
+            );
+            XposedBridge.log(TAG + ": AOSP native Bluetooth rename dialog hook installed.");
         } catch (Throwable t) {
-            XposedBridge.log("BluePrivacy: AOSP rename dialog class not present; "
-                    + "framework API observer remains active (" + t.getClass().getSimpleName() + ")");
+            XposedBridge.log(TAG + ": AOSP rename dialog class not present; public API observer active.");
         }
     }
 
-    private void hookBluetoothStack(ClassLoader classLoader) {
-        // Observe the final Android Bluetooth-stack name setter. If this reports
-        // false, the failure is below Settings (native stack/HAL/vendor service).
+    private static void hookBluetoothStack(ClassLoader classLoader) {
+        // Record only whether the final native property setter accepts a write.
         try {
             XposedHelpers.findAndHookMethod(
-                    "com.android.bluetooth.btservice.AdapterProperties",
-                    classLoader,
-                    "setName",
-                    String.class,
-                    new XC_MethodHook() {
-                        @Override protected void beforeHookedMethod(MethodHookParam param) {
-                            XposedBridge.log("BluePrivacy: Bluetooth stack AdapterProperties.setName("
-                                    + safeName(param.args[0]) + ")");
-                        }
-
-                        @Override protected void afterHookedMethod(MethodHookParam param) {
-                            XposedBridge.log("BluePrivacy: native Bluetooth name setter result="
-                                    + param.getResult());
-                        }
-                    });
-            XposedBridge.log("BluePrivacy: hooked AdapterProperties.setName");
+                "com.android.bluetooth.btservice.AdapterProperties",
+                classLoader,
+                "setName",
+                String.class,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        Object value = param.args[0];
+                        int bytes = value instanceof String
+                            ? ((String) value).getBytes(StandardCharsets.UTF_8).length : -1;
+                        XposedBridge.log(TAG + ": AdapterProperties.setName"
+                            + " result=" + param.getResult() + " utf8Bytes=" + bytes);
+                    }
+                }
+            );
+            XposedBridge.log(TAG + ": Bluetooth AdapterProperties observer installed.");
         } catch (Throwable t) {
-            XposedBridge.log("BluePrivacy: AdapterProperties hook unavailable: " + t);
+            XposedBridge.log(TAG + ": AdapterProperties observer unavailable: "
+                + t.getClass().getSimpleName());
         }
 
-        // Some Android 16/vendor builds place the Binder implementation in a
-        // nested class. Hook matching setName methods when that class exists.
-        hookBinderSetName("com.android.bluetooth.btservice.AdapterService$AdapterServiceBinder",
-                classLoader);
-        hookBinderSetName("com.android.bluetooth.btservice.AdapterServiceBinder",
-                classLoader);
+        // Android 12+ Bluetooth service path:
+        // AdapterService.setName(String, AttributionSource) validates the caller,
+        // then calls AdapterProperties.setName(String). If the stock call returns
+        // false, make one local retry ONLY for a verified installed Settings UID.
+        // This does not alter permission checks for third-party apps.
+        try {
+            Class<?> attributionClass = XposedHelpers.findClass(
+                "android.content.AttributionSource", classLoader);
+            XposedHelpers.findAndHookMethod(
+                "com.android.bluetooth.btservice.AdapterService",
+                classLoader,
+                "setName",
+                String.class,
+                attributionClass,
+                new XC_MethodHook() {
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        if (param.hasThrowable() || Boolean.TRUE.equals(param.getResult())) return;
+
+                        try {
+                            Object rawName = param.args[0];
+                            if (!(rawName instanceof String)) return;
+                            String name = ((String) rawName).trim();
+                            if (!isValidName(name)) return;
+
+                            Object source = param.args[1];
+                            if (source == null) return;
+                            String sourcePackage = (String) XposedHelpers.callMethod(
+                                source, "getPackageName");
+                            int sourceUid = ((Number) XposedHelpers.callMethod(
+                                source, "getUid")).intValue();
+
+                            if (!isVerifiedSettingsAttribution(
+                                    param.thisObject, sourcePackage, sourceUid)) {
+                                return;
+                            }
+
+                            Object adapter = XposedHelpers.getObjectField(
+                                param.thisObject, "mAdapter");
+                            if (adapter == null) return;
+                            int state = ((Number) XposedHelpers.callMethod(
+                                adapter, "getState")).intValue();
+                            if (state != BluetoothAdapter.STATE_ON) return;
+
+                            Object properties = XposedHelpers.getObjectField(
+                                param.thisObject, "mAdapterProperties");
+                            if (properties == null) return;
+
+                            Object fallback = XposedHelpers.callMethod(
+                                properties, "setName", name);
+                            if (Boolean.TRUE.equals(fallback)) {
+                                // Only report success when the actual local native setter accepts it.
+                                param.setResult(Boolean.TRUE);
+                                XposedBridge.log(TAG + ": verified Settings local fallback accepted"
+                                    + " state=" + state
+                                    + " utf8Bytes=" + name.getBytes(StandardCharsets.UTF_8).length);
+                            } else {
+                                XposedBridge.log(TAG + ": verified Settings local fallback rejected"
+                                    + " state=" + state);
+                            }
+                        } catch (Throwable t) {
+                            XposedBridge.log(TAG + ": service fallback unavailable: "
+                                + t.getClass().getSimpleName());
+                        }
+                    }
+                }
+            );
+            XposedBridge.log(TAG + ": AdapterService local fallback hook installed.");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": AdapterService fallback hook unavailable: "
+                + t.getClass().getSimpleName());
+        }
+
+        // Observe vendor/AOSP Binder wrapper variants without changing their arguments.
+        hookBinderSetName(
+            "com.android.bluetooth.btservice.AdapterService$AdapterServiceBinder", classLoader);
+        hookBinderSetName(
+            "com.android.bluetooth.btservice.AdapterServiceBinder", classLoader);
     }
 
-    private void hookBinderSetName(String className, ClassLoader classLoader) {
+    private static boolean isVerifiedSettingsAttribution(
+            Object serviceObject, String packageName, int uid) {
+        if (packageName == null || uid < 0 || !SETTINGS_PACKAGES.contains(packageName)) return false;
+        if (!(serviceObject instanceof Context)) return false;
+
+        try {
+            String[] packages = ((Context) serviceObject)
+                .getPackageManager().getPackagesForUid(uid);
+            if (packages == null) return false;
+            for (String installed : packages) {
+                if (packageName.equals(installed)) return true;
+            }
+        } catch (Throwable ignored) {
+            // Fail closed if package-to-UID verification is unavailable.
+        }
+        return false;
+    }
+
+    private static void hookBinderSetName(String className, ClassLoader classLoader) {
         try {
             Class<?> target = XposedHelpers.findClassIfExists(className, classLoader);
             if (target == null) return;
             for (Method method : target.getDeclaredMethods()) {
                 if (!"setName".equals(method.getName())) continue;
                 XposedBridge.hookMethod(method, new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        if (param.args != null && param.args.length > 0) {
-                            XposedBridge.log("BluePrivacy: Bluetooth Binder setName("
-                                    + safeName(param.args[0]) + ")");
-                        }
-                    }
-
-                    @Override protected void afterHookedMethod(MethodHookParam param) {
-                        XposedBridge.log("BluePrivacy: Bluetooth Binder setName result="
-                                + param.getResult());
+                    @Override
+                    protected void afterHookedMethod(MethodHookParam param) {
+                        int bytes = (param.args != null && param.args.length > 0
+                                && param.args[0] instanceof String)
+                            ? ((String) param.args[0]).getBytes(StandardCharsets.UTF_8).length : -1;
+                        XposedBridge.log(TAG + ": Binder setName result="
+                            + param.getResult() + " utf8Bytes=" + bytes);
                     }
                 });
             }
         } catch (Throwable t) {
-            XposedBridge.log("BluePrivacy: Binder hook unavailable for "
-                    + className + ": " + t);
+            XposedBridge.log(TAG + ": Binder observer unavailable for "
+                + className + ": " + t.getClass().getSimpleName());
         }
     }
 
     private static boolean isValidName(String name) {
         return name != null && !name.isEmpty()
-                && name.getBytes(StandardCharsets.UTF_8).length <= MAX_NAME_BYTES;
-    }
-
-    private static String safeName(Object value) {
-        if (value == null) return "<null>";
-        String text = String.valueOf(value);
-        return text.length() > 64 ? text.substring(0, 64) + "…" : text;
-    }
-
-    private static Object callQuietly(Object target, String method) {
-        try {
-            return XposedHelpers.callMethod(target, method);
-        } catch (Throwable ignored) {
-            return "<unavailable>";
-        }
+            && name.getBytes(StandardCharsets.UTF_8).length <= MAX_NAME_BYTES;
     }
 }

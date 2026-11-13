@@ -1,20 +1,32 @@
-# BluePrivacy Xposed
+# BluePrivacy LSPosed
 
-BluePrivacy is an LSPosed/Xposed module focused on the native Android Bluetooth friendly-name save flow.
+BluePrivacy 1.4 is a local-only LSPosed/Xposed module for the native Android/ColorOS Bluetooth friendly-name save path.
 
-## Current hook scope
+## Recommended LSPosed scope
 
-- `com.android.settings`: observes `BluetoothAdapter.setName(String)` and intercepts the AOSP `LocalDeviceNameDialogFragment.setDeviceName(String)` path. It uses the official Android API and suppresses the ROM wrapper only after the requested name is read back successfully.
-- `com.android.bluetooth`: observes the Bluetooth stack's `AdapterProperties.setName(String)` and available Binder `setName` entrypoints to help identify a failure below Settings.
-- No Wi-Fi or mobile-data APIs are used by this module.
-- No Bluetooth MAC, IMEI, OAID, serial number, or other device identifiers are accessed or changed.
+- `com.android.settings`
+- `com.oplus.settings`
+- `com.oneplus.settings`
+- `com.coloros.settings`
+- `com.android.bluetooth`
 
-## Build
+The module:
+- Observes the native Settings call to `BluetoothAdapter.setName(String)`.
+- Hooks the AOSP `LocalDeviceNameDialogFragment.setDeviceName(String)` save method when that class exists.
+- In the Bluetooth process, observes the final `AdapterProperties.setName(String)` native-property setter.
+- Includes a narrowly constrained fallback for Android 12+ `AdapterService.setName(String, AttributionSource)`: only after the stock call fails, only when the attribution package is a real installed Settings package whose UID maps back to that package, and only while Bluetooth is `STATE_ON`. The fallback calls the same local `AdapterProperties.setName()` operation and reports success only if the native setter accepts it.
+- Does not fake Wi-Fi/mobile connectivity, does not create a network route, and does not call any network API.
 
-GitHub Actions workflow **Build BluePrivacy APK** builds `app-debug.apk` and uploads it as artifact `BluePrivacy-debug-apk`.
+## Privacy
 
-## Important compatibility note
+- No `android.permission.INTERNET` or other network permissions.
+- No HTTP, HTTPS, sockets, analytics, advertising, telemetry, remote configuration, cloud sync, or crash-upload code.
+- No third-party SDK. Xposed API is `compileOnly` and is not packaged into the APK.
+- The requested Bluetooth name is not written to Xposed logs; logs contain only state, byte count, and success/failure.
+- No Bluetooth MAC, IMEI, OAID, serial number, or other device identifiers are read or changed.
 
-AOSP Settings uses `LocalDeviceNameDialogFragment.setDeviceName()` and then `BluetoothAdapter.setName()`. ColorOS may replace this implementation or its Bluetooth service. The module includes an AOSP-compatible interception and service-layer diagnostics, but an APK build alone cannot prove that the ColorOS 16 vendor path is fixed on a specific handset. If the framework API or native Bluetooth setter itself returns false, the failure is below the Settings dialog and cannot honestly be called fixed by this hook.
+The APK itself does not upload data. GitHub Actions uploads only the generated APK artifact to this repository's GitHub Actions storage for download; that build step does not collect data from the phone.
 
-The module scope must include **Settings** (`com.android.settings`) and **Bluetooth** (`com.android.bluetooth`) in LSPosed for both hook layers to load.
+## Compatibility note
+
+The Bluetooth service fallback follows the AOSP Android Bluetooth implementation. ColorOS may replace private Settings or Bluetooth classes. If its save dialog blocks the action before calling `BluetoothAdapter.setName()`, or its native Bluetooth stack rejects the property, this generic hook cannot guarantee a fix without matching that ColorOS-specific implementation. A successful build is not proof of runtime compatibility on a physical OnePlus Ace 5 Pro.
